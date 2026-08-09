@@ -8,9 +8,6 @@ import android.net.Uri
 import android.provider.ContactsContract
 import android.util.Log
 import androidx.core.content.ContextCompat
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import java.util.Locale
 
 class ContactsManager(
     private val context: Context
@@ -20,28 +17,25 @@ class ContactsManager(
     }
 
     /**
-     * Attempts to find a contact matching the provided string parameter and opens the device dialer.
-     * Modified to use a thread-safe implementation to prevent main thread execution drops.
+     * Looks up and returns the phone number string for a given contact name.
      */
-    fun callContact(name: String): Boolean {
-        if (name.isBlank()) return false
-        
+    fun getPhoneNumber(name: String): String? {
+        if (name.isBlank()) return null
+
         if (ContextCompat.checkSelfPermission(
                 context,
                 Manifest.permission.READ_CONTACTS
             ) != PackageManager.PERMISSION_GRANTED
         ) {
             Log.w(TAG, "Cannot access phone book: READ_CONTACTS permission was not granted by user.")
-            return false
+            return null
         }
 
-        // Use Android's optimized database filtering projection structures
         val projection = arrayOf(
-            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-            ContactsContract.CommonDataKinds.Phone.NUMBER
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
         )
 
-        // Filter results via structured SQL query parameters rather than manual parsing loops
         val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?"
         val selectionArgs = arrayOf("%$name%")
 
@@ -55,7 +49,54 @@ class ContactsManager(
             )
 
             cursor?.use { validCursor ->
-                // Resolve correct column indexes dynamically rather than relying on hardcoded numbers
+                val numberIndex = validCursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                if (numberIndex != -1 && validCursor.moveToFirst()) {
+                    val phone = validCursor.getString(numberIndex)
+                    if (!phone.isNullOrBlank()) {
+                        return phone
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Encountered database exception querying contact phone number", e)
+        }
+
+        return null
+    }
+
+    /**
+     * Attempts to find a contact matching the provided string parameter and opens the device dialer.
+     */
+    fun callContact(name: String): Boolean {
+        if (name.isBlank()) return false
+        
+        if (ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.READ_CONTACTS
+            ) != PackageManager.PERMISSION_GRANTED
+        ) {
+            Log.w(TAG, "Cannot access phone book: READ_CONTACTS permission was not granted by user.")
+            return false
+        }
+
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER
+        )
+
+        val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} LIKE ?"
+        val selectionArgs = arrayOf("%$name%")
+
+        try {
+            val cursor = context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                selection,
+                selectionArgs,
+                null
+            )
+
+            cursor?.use { validCursor ->
                 val nameIndex = validCursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
                 val numberIndex = validCursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
 

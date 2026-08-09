@@ -105,4 +105,7 @@ dependencies {
     // Canvas Prototyping Diagnostics Tools Loop
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
+    
+    // MediaPipe LLM Inference for running local AI models on-device
+    implementation("com.google.mediapipe:tasks-genai:0.10.14")
 }

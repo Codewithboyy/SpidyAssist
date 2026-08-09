@@ -4,21 +4,27 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.util.Log
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.lifecycle.lifecycleScope
 
 class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
 
@@ -37,7 +43,6 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
     private var lastCommand = ""
     private var lastCommandTime = 0L
 
-    // The core OS Permission Handoff chain
     private val permissionLauncher =
         registerForActivityResult(
             ActivityResultContracts.RequestMultiplePermissions()
@@ -45,8 +50,6 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
             val audioGranted = result[Manifest.permission.RECORD_AUDIO] == true
             Log.d(TAG, "Audio permission granted status: $audioGranted")
             
-            // CHAIN STEP 2: Now that OS dialogs are completely closed, 
-            // request the specialized battery optimizations exemption
             checkAndRequestBatteryExemption()
             
             if (audioGranted) {
@@ -57,20 +60,36 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Siri-Style Overlay Setup: Configures the window layer flags 
-        // to dim the background home screen wallpaper softly behind your overlay sheet.
-        window.setDimAmount(0.55f)
-        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+        // Edge-to-edge layout & hiding system navigation bars
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.statusBarColor = AndroidColor.TRANSPARENT
+        window.navigationBarColor = AndroidColor.TRANSPARENT
+        
+        hideSystemNavigation()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+            )
+        }
+        
+        // Soft background dimming
+        window.setDimAmount(0.30f)
+        window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
         
         commandProcessor = CommandProcessor(this)
         assistant = Assistant(this)
         voiceManager = VoiceManager(this, this)
 
-        // CHAIN STEP 1: Launch core system microphone & notification alerts first
         requestCoreSystemPermissions()
         handleIntent(intent)
 
-        status.value = "Initializing engine..."
+        status.value = "Initializing..."
         
         CoroutineScope(Dispatchers.IO).launch {
             val modelDir = java.io.File(filesDir, "model")
@@ -109,10 +128,25 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
                         } else {
                             requestCoreSystemPermissions()
                         }
+                    },
+                    onDismiss = {
+                        finish()
                     }
                 )
             }
         }
+    }
+
+    private fun hideSystemNavigation() {
+        val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
+        windowInsetsController.systemBarsBehavior =
+            WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        windowInsetsController.hide(WindowInsetsCompat.Type.navigationBars())
+    }
+
+    override fun onResume() {
+        super.onResume()
+        hideSystemNavigation()
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -152,42 +186,30 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
         }
     }
 
-    /**
-     * Cleaned Up: Requests basic hardware/OS elements together.
-     */
     private fun requestCoreSystemPermissions() {
         val permissions = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.READ_CONTACTS
         )
 
-        // Add notification alerts for Android 13+ (API 33+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
-        // Modern media file access routing rules
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
             permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
         } else {
-            // Fallback option for legacy devices running Android 12 or below
             @Suppress("DEPRECATION")
             permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
 
-        Log.d(TAG, "Launching system permission request panel for all registered modules.")
         permissionLauncher.launch(permissions.toTypedArray())
     }
 
-    /**
-     * Isolated Execution: Fired ONLY after core dialog boxes resolve 
-     * to prevent Android lifecycle interruptions.
-     */
     private fun checkAndRequestBatteryExemption() {
         try {
-            // 1. SYSTEM OVERLAY CHECK: Ask permission to draw over home screen wallpaper
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (!android.provider.Settings.canDrawOverlays(this)) {
                     val intent = Intent(
@@ -195,11 +217,10 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
                         Uri.parse("package:$packageName")
                     )
                     startActivity(intent)
-                    return // Delay battery check until overlay window requirement satisfies
+                    return
                 }
             }
 
-            // 2. BATTERY OPTIMIZATION CHECK (Fires right after overlay finishes)
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (!pm.isIgnoringBatteryOptimizations(packageName)) {
@@ -240,15 +261,17 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
 
         messages.add(Message(command, true))
 
-        val response = commandProcessor.process(command)
-        messages.add(Message(response, false))
-        status.value = "Ready"
+        lifecycleScope.launch {
+            val response = commandProcessor.process(command)
+            messages.add(Message(response, false))
+            status.value = "Ready"
 
-        assistant.handleResponse(response) {
-            WakeWordService.resetProcessing()
+            assistant.handleResponse(response) {
+                WakeWordService.resetProcessing()
+            }
+            
+            voiceManager.stopListening()
         }
-        
-        voiceManager.stopListening()
     }
 
     override fun onError(errorCode: Int) {

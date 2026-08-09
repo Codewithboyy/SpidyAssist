@@ -3,14 +3,17 @@ package com.spydr.spidy
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.Service
-import android.content.Intent
 import android.app.PendingIntent
-import android.content.Context // REQUIRED IMPORT FOR WAKELOCK MANAGEMENT
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.graphics.PixelFormat
 import android.os.Build
 import android.os.IBinder
-import android.os.PowerManager // REQUIRED IMPORT FOR POWER CONFIGURATION
+import android.os.PowerManager
 import android.util.Log
+import android.view.View
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 
 class WakeWordService : Service(), WakeWordDetector.Listener {
@@ -31,11 +34,9 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
         }
     }
     
-    // STEP 2 VARIABLE LOCATION: Track lock allocation across runtime instances
     private var wakeLock: PowerManager.WakeLock? = null
     private lateinit var wakeWordDetector: WakeWordDetector
     
-    // TRACKING VARIABLE: Keep a reference to the invisible view window overlay layer
     private var overlayView: View? = null
     private var windowManager: WindowManager? = null
 
@@ -43,12 +44,9 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
         super.onCreate()
         instance = this
 
-        // STEP 2 HOOK LOCATION: Acquire lock at the immediate entry point of onCreate
-        // This ensures the CPU cannot drop context lines while the engine starts
         try {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
             wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Spidy:BackgroundMicLock").apply {
-                // Safe 10-minute structural auto-timeout release to protect device diagnostics
                 acquire(10 * 60 * 1000L) 
             }
             Log.d(TAG, "Continuous tracking background WakeLock successfully acquired.")
@@ -59,7 +57,6 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
         createNotificationChannel()
         startForegroundServiceSafely()
         
-        // WORKAROUND: Force an invisible system overlay to keep microphone permission unfrozen on home screen
         createInvisibleOverlayWindow()
 
         wakeWordDetector = WakeWordDetector(
@@ -74,7 +71,6 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
             windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
             overlayView = View(this)
 
-            // Setup a 1x1 transparent layout frame configuration
             val layoutType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
             } else {
@@ -83,7 +79,7 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
             }
 
             val params = WindowManager.LayoutParams(
-                1, 1, // 1-pixel frame size
+                1, 1,
                 layoutType,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or 
                         WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or 
@@ -134,29 +130,47 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
         isProcessing = true
         pauseListening()
 
-        val intent = Intent(this, MainActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
-                    Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                    Intent.FLAG_ACTIVITY_CLEAR_TOP
+        // Launch MainActivity over the active app/screen
+        try {
+            val intent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT
 
-            putExtra("START_LISTENING", true)
+                putExtra("START_LISTENING", true)
+            }
+
+            // Using PendingIntent allows bypassing Android 10+ background activity start restrictions
+            val pendingIntent = PendingIntent.getActivity(
+                this,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            pendingIntent.send()
+            Log.d(TAG, "Successfully popped Spidy Assist onto screen via wake word trigger.")
+        } catch (e: Exception) {
+            Log.e(TAG, "PendingIntent launch failed, falling back to direct startActivity", e)
+            val fallbackIntent = Intent(this, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("START_LISTENING", true)
+            }
+            startActivity(fallbackIntent)
         }
-        startActivity(intent)
     }
     
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Clear any previous startup configurations and force a high priority refresh
         createNotificationChannel()
         startForegroundServiceSafely()
-        
         return START_STICKY
     }
 
     override fun onDestroy() {
         instance = null
 
-        // STEP 2 CLEANUP LOCATION: Release your lock claim cleanly 
-        // to prevent background battery warning warnings on target systems
         try {
             if (wakeLock?.isHeld == true) {
                 wakeLock?.release()
@@ -166,7 +180,6 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
             Log.e(TAG, "Error finalizing wake lock lifecycle allocation during destroy", e)
         }
         
-        // CLEANUP Overlay view resource tracking structures cleanly to avoid leaks
         try {
             if (overlayView != null && windowManager != null) {
                 windowManager?.removeView(overlayView)
@@ -189,15 +202,12 @@ class WakeWordService : Service(), WakeWordDetector.Listener {
             val channel = NotificationChannel(
                 CHANNEL_ID,
                 "Spidy Assistant Persistent Monitor",
-                // CRITICAL CHANGE: Changed IMPORTANCE_LOW to IMPORTANCE_HIGH.
-                // This lets the OS know that dropping this service interrupts user expectations.
                 NotificationManager.IMPORTANCE_HIGH 
             ).apply {
                 description = "Always-on voice wake word tracking loop"
                 setShowBadge(false)
                 lockscreenVisibility = Notification.VISIBILITY_PUBLIC
             }
-            channel.description = "Wake word detection"
             val manager = getSystemService(NotificationManager::class.java)
             manager?.createNotificationChannel(channel)
         }
