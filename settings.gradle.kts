@@ -1,24 +1,22 @@
 pluginManagement {
     repositories {
-        gradlePluginPortal()
         google()
         mavenCentral()
+        gradlePluginPortal()
+        maven("https://chaquo.com/maven")
+        maven("/data/data/com.itsaky.androidide/files/home/maven/localMvnRepository")
     }
 }
 
 dependencyResolutionManagement {
-    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)
     repositories {
         google()
         mavenCentral()
-        
-        // Fixed: Explicitly wrapped the String route string inside uri() 
-        // to comply with Gradle 8.x+ strict plugin compilation specifications
-        maven { url = uri("https://jitpack.io") }
+        maven("https://chaquo.com/maven")
+        maven("/data/data/com.itsaky.androidide/files/home/maven/localMvnRepository")
     }
 }
 
 rootProject.name = "Spidy Assist"
-
 include(":app")

@@ -4,20 +4,23 @@ import java.io.FileInputStream
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
-    // The modern Compose Compiler tracking plugin which eliminates the old manual composeOptions block
-    id("org.jetbrains.kotlin.plugin.compose")
+    id("com.chaquo.python")
 }
 
 val keystoreProps = Properties()
 val keystoreFile = rootProject.file("release.properties")
-
 if (keystoreFile.exists()) {
     keystoreProps.load(FileInputStream(keystoreFile))
 }
 
+val localProperties = Properties()
+val localPropertiesFile = rootProject.file("local.properties")
+if (localPropertiesFile.exists()) {
+    localProperties.load(FileInputStream(localPropertiesFile))
+}
+
 android {
     namespace = "com.spydr.spidy"
-    // Target SDK 36 requires using Java 17+ tooling rules
     compileSdk = 36
 
     defaultConfig {
@@ -27,13 +30,19 @@ android {
         versionCode = 1
         versionName = "1.0"
 
+        val groqApiKey = localProperties.getProperty("GROQ_API_KEY") ?: ""
+        buildConfigField("String", "GROQ_API_KEY", "\"$groqApiKey\"")
+
         vectorDrawables {
             useSupportLibrary = true
+        }
+
+        ndk {
+            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
         }
     }
 
     compileOptions {
-        // Upgraded bytecode toolchain targets to Java 17 to meet targetSdk 36 build platform mandates
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -44,6 +53,11 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
+    }
+
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.8"
     }
 
     packaging {
@@ -51,10 +65,12 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
         jniLibs {
-            // Essential safeguard: Prevent Vosk native JNI engine components (.so libs) 
-            // from being corrupted or improperly compressed during production packaging
             useLegacyPackaging = true
-            pickFirsts += "lib/**/libvosk_jni.so"
+            pickFirsts += listOf(
+                "lib/**/libvosk_jni.so",
+                "lib/**/libllama.so",
+                "lib/**/libggml*.so"
+            )
         }
     }
 
@@ -62,7 +78,6 @@ android {
         debug {
             isMinifyEnabled = false
         }
-
         release {
             isMinifyEnabled = false
             proguardFiles(
@@ -74,38 +89,29 @@ android {
 }
 
 dependencies {
-    // Jetpack Compose BOM Integration Lane
     implementation(platform("androidx.compose:compose-bom:2024.09.00"))
 
-    // Android Core KTX Layer
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.2")
 
-    // Android Architecture Components Lifecycle Layer
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
-    // UI & Core Graphics Elements Deck
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
-    
-    // Design Componentry Infrastructure
+
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // Asynchronous Flow Execution Context
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Offline Voice Processing Engine Model Artifact (Target API 34+ AAR Release wrapper)
-    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("net.java.dev.jna:jna:5.14.0@aar")
+    implementation("com.google.code.gson:gson:2.10.1")
     implementation("com.alphacephei:vosk-android:0.3.47")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Canvas Prototyping Diagnostics Tools Loop
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
-    
-    // MediaPipe LLM Inference for running local AI models on-device
-    implementation("com.google.mediapipe:tasks-genai:0.10.14")
 }

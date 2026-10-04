@@ -11,7 +11,13 @@ object AssetUtils {
     private const val TAG = "AssetUtils"
 
     /**
-     * Recursively copies an entire assets subdirectory folder layout into target app file storage.
+     * Recursively copies an assets folder (e.g., Vosk acoustic model) into target storage.
+     * Skips existing files to prevent unnecessary disk reads/writes on every app startup.
+     *
+     * @param context Application context
+     * @param assetFolder Relative path inside app assets (e.g., "model-en-us")
+     * @param destination Destination directory in app internal/external storage
+     * @return True if the copy completed successfully
      */
     fun copyAssetFolder(
         context: Context,
@@ -20,7 +26,7 @@ object AssetUtils {
     ): Boolean {
         try {
             if (!destination.exists() && !destination.mkdirs()) {
-                Log.e(TAG, "Failed to create destination directories tree at: ${destination.absolutePath}")
+                Log.e(TAG, "Failed to create destination directories at: ${destination.absolutePath}")
                 return false
             }
 
@@ -28,35 +34,55 @@ object AssetUtils {
 
             for (file in files) {
                 val assetPath = if (assetFolder.isEmpty()) file else "$assetFolder/$file"
+                val targetFile = File(destination, file)
 
-                // A cleaner optimization pattern: Attempt to open the resource path directly as a file.
-                // If it fails with an IOException, it is structural directory layout metadata.
-                // This eliminates the redundant, highly expensive double-listing asset.list() overhead loop.
                 if (isAssetDirectory(context, assetPath)) {
-                    val nextDestination = File(destination, file)
-                    if (!copyAssetFolder(context, assetPath, nextDestination)) {
+                    if (!copyAssetFolder(context, assetPath, targetFile)) {
                         return false
                     }
                 } else {
-                    val targetOutFile = File(destination, file)
-                    copyAssetFile(context, assetPath, targetOutFile)
+                    // Only copy if the target file does not exist or size differs
+                    if (!targetFile.exists() || targetFile.length() != getAssetFileSize(context, assetPath)) {
+                        copyAssetFile(context, assetPath, targetFile)
+                    }
                 }
             }
             return true
         } catch (e: Exception) {
-            Log.e(TAG, "Terminal failure while recursively copying asset directory: $assetFolder", e)
+            Log.e(TAG, "Failure while copying asset directory: $assetFolder", e)
             return false
         }
     }
 
+    /**
+     * Accurately determines if an asset path is a directory by checking child entries.
+     */
     private fun isAssetDirectory(context: Context, assetPath: String): Boolean {
         return try {
-            // If the stream cleanly opens, it is a readable file data container descriptor element
-            context.assets.open(assetPath).close()
-            false
+            val children = context.assets.list(assetPath)
+            !children.isNullOrEmpty()
         } catch (e: IOException) {
-            // An IOException on open implies it's a structural namespace folder directory node descriptor layout
-            true
+            false
+        }
+    }
+
+    /**
+     * Gets asset file length to check if re-copying is required.
+     */
+    private fun getAssetFileSize(context: Context, assetPath: String): Long {
+        return try {
+            context.assets.openFd(assetPath).use { fd ->
+                fd.length
+            }
+        } catch (e: IOException) {
+            // Fallback for compressed assets where openFd() isn't supported
+            try {
+                context.assets.open(assetPath).use { stream ->
+                    stream.available().toLong()
+                }
+            } catch (e2: Exception) {
+                -1L
+            }
         }
     }
 
@@ -68,11 +94,12 @@ object AssetUtils {
         try {
             context.assets.open(assetName).use { input ->
                 FileOutputStream(outFile).use { output ->
-                    input.copyTo(output)
+                    input.copyTo(output, bufferSize = 8192)
                 }
             }
+            Log.d(TAG, "Successfully copied asset: $assetName -> ${outFile.absolutePath}")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to write raw data payload stream chunk onto target storage path file: ${outFile.name}", e)
+            Log.e(TAG, "Failed to copy asset file: $assetName", e)
             throw e
         }
     }

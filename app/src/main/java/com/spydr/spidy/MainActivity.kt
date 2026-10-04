@@ -4,7 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.graphics.Color as AndroidColor
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -14,22 +13,33 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import kotlinx.coroutines.CoroutineScope
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import androidx.lifecycle.lifecycleScope
 
 class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
 
     private companion object {
         private const val TAG = "MainActivity"
+        private const val PREFS_NAME = "spidy_main_prefs"
+        private const val KEY_PERSISTENT_SESSION = "persistent_session_id"
+        private const val KEY_LAST_ACTIVE = "last_active_time"
+
+        // Session expires after 30 minutes of idle — feels like a fresh conversation
+        private const val SESSION_IDLE_EXPIRY_MS = 30 * 60 * 1000L
+
+        private val COMPLETED_THINK_REGEX = Regex("<think>[\\s\\S]*?</think>")
+        private val STREAMING_THINK_REGEX = Regex("<think>[\\s\\S]*$")
     }
 
     private lateinit var assistant: Assistant
@@ -39,32 +49,28 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
     private val messages = mutableStateListOf<Message>()
     private val status = mutableStateOf("Ready")
     private var listening by mutableStateOf(false)
-    
+
     private var lastCommand = ""
     private var lastCommandTime = 0L
 
+    // Persistent session — survives wake triggers and activity restarts
+    private var persistentSessionId: Long = -1L
+
     private val permissionLauncher =
-        registerForActivityResult(
-            ActivityResultContracts.RequestMultiplePermissions()
-        ) { result ->
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
             val audioGranted = result[Manifest.permission.RECORD_AUDIO] == true
-            Log.d(TAG, "Audio permission granted status: $audioGranted")
-            
+            Log.d(TAG, "Audio permission granted: $audioGranted")
             checkAndRequestBatteryExemption()
-            
-            if (audioGranted) {
-                startWakeWordServiceSafely()
-            }
+            if (audioGranted) WakeWordService.startService(this)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // Edge-to-edge layout & hiding system navigation bars
+
         WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.statusBarColor = AndroidColor.TRANSPARENT
-        window.navigationBarColor = AndroidColor.TRANSPARENT
-        
+        val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+        insetsController.isAppearanceLightStatusBars = false
+        insetsController.isAppearanceLightNavigationBars = false
         hideSystemNavigation()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
@@ -74,36 +80,24 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
             @Suppress("DEPRECATION")
             window.addFlags(
                 WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
-                WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                        WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
             )
         }
-        
-        // Soft background dimming
-        window.setDimAmount(0.30f)
+
+        window.setDimAmount(0.35f)
         window.addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
-        
+
         commandProcessor = CommandProcessor(this)
         assistant = Assistant(this)
         voiceManager = VoiceManager(this, this)
 
-        requestCoreSystemPermissions()
-        handleIntent(intent)
+        // Restore or create persistent session
+        persistentSessionId = getOrCreatePersistentSession()
+        SpidyStateManager.restoreSession(persistentSessionId)
 
-        status.value = "Initializing..."
-        
-        CoroutineScope(Dispatchers.IO).launch {
-            val modelDir = java.io.File(filesDir, "model")
-            if (!modelDir.exists()) {
-                AssetUtils.copyAssetFolder(this@MainActivity, "model", modelDir)
-            }
-            
-            withContext(Dispatchers.Main) {
-                status.value = "Ready"
-                if (!listening) {
-                    startWakeWordServiceSafely()
-                }
-            }
-        }
+        requestCoreSystemPermissions()
+        WakeWordService.startService(this)
+        handleIntent(intent)
 
         setContent {
             MaterialTheme {
@@ -115,33 +109,74 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
                         if (listening) {
                             voiceManager.stopListening()
                         } else {
-                            voiceManager.startListening()
+                            // Reuse persistent session — don't create new one
+                            val sessionId = getOrCreatePersistentSession()
+                            SpidyStateManager.transitionTo(AssistantState.COMMAND_LISTENING, sessionId)
+                            WakeWordService.stopListening(this)
+                            voiceManager.startListening(sessionId)
+                        }
+                    },
+                    onSendTextCommand = { typedQuery ->
+                        if (typedQuery.isNotBlank()) {
+                            val sessionId = getOrCreatePersistentSession()
+                            WakeWordService.stopListening(this)
+                            onCommand(typedQuery, sessionId)
                         }
                     },
                     onStartService = {
                         if (ContextCompat.checkSelfPermission(
-                                this,
-                                Manifest.permission.RECORD_AUDIO
+                                this, Manifest.permission.RECORD_AUDIO
                             ) == PackageManager.PERMISSION_GRANTED
                         ) {
-                            startWakeWordServiceSafely()
+                            WakeWordService.startService(this)
                         } else {
                             requestCoreSystemPermissions()
                         }
                     },
-                    onDismiss = {
-                        finish()
-                    }
+                    onDismiss = { finish() }
                 )
             }
         }
     }
 
+    /**
+     * Returns existing session if within idle window, else creates a new one.
+     * This is the single source of truth for session ID across the app.
+     */
+    private fun getOrCreatePersistentSession(): Long {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedId = prefs.getLong(KEY_PERSISTENT_SESSION, -1L)
+        val lastActive = prefs.getLong(KEY_LAST_ACTIVE, 0L)
+        val now = System.currentTimeMillis()
+
+        return if (savedId != -1L && (now - lastActive) < SESSION_IDLE_EXPIRY_MS) {
+            // Session still warm — reuse it, memory intact
+            Log.d(TAG, "Reusing session $savedId (idle: ${(now - lastActive) / 1000}s)")
+            persistentSessionId = savedId
+            savedId
+        } else {
+            // Session expired or first launch — create fresh
+            val newId = now
+            prefs.edit()
+                .putLong(KEY_PERSISTENT_SESSION, newId)
+                .putLong(KEY_LAST_ACTIVE, now)
+                .apply()
+            Log.d(TAG, "New session created: $newId")
+            persistentSessionId = newId
+            newId
+        }
+    }
+
+    private fun touchSession() {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit().putLong(KEY_LAST_ACTIVE, System.currentTimeMillis()).apply()
+    }
+
     private fun hideSystemNavigation() {
-        val windowInsetsController = WindowCompat.getInsetsController(window, window.decorView)
-        windowInsetsController.systemBarsBehavior =
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
             WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        windowInsetsController.hide(WindowInsetsCompat.Type.navigationBars())
+        controller.hide(WindowInsetsCompat.Type.navigationBars())
     }
 
     override fun onResume() {
@@ -158,45 +193,29 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
     private fun handleIntent(intent: Intent?) {
         if (intent == null) return
         val startListening = intent.getBooleanExtra("START_LISTENING", false)
+        val intentSessionId = intent.getLongExtra("SESSION_ID", -1L)
+
         if (startListening) {
             intent.removeExtra("START_LISTENING")
-        
-            try {
-                WakeWordService.resetProcessing()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error handling service mic handoff", e)
-            }
-        
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                voiceManager.startListening()
-            }, 300)
-        }
-    }
+            intent.removeExtra("SESSION_ID")
 
-    private fun startWakeWordServiceSafely() {
-        try {
-            val intent = Intent(this, WakeWordService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize foreground sticky service setup", e)
+            // Use persistent session — not the one from the wake word service (which creates new)
+            val sessionId = getOrCreatePersistentSession()
+            SpidyStateManager.transitionTo(AssistantState.COMMAND_LISTENING, sessionId)
+            WakeWordService.stopListening(this)
+            voiceManager.startListening(sessionId)
         }
     }
 
     private fun requestCoreSystemPermissions() {
         val permissions = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.READ_CONTACTS
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE,
+            Manifest.permission.SEND_SMS
         )
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             permissions.add(Manifest.permission.READ_MEDIA_IMAGES)
             permissions.add(Manifest.permission.READ_MEDIA_VIDEO)
             permissions.add(Manifest.permission.READ_MEDIA_AUDIO)
@@ -204,7 +223,6 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
             @Suppress("DEPRECATION")
             permissions.add(Manifest.permission.READ_EXTERNAL_STORAGE)
         }
-
         permissionLauncher.launch(permissions.toTypedArray())
     }
 
@@ -212,81 +230,127 @@ class MainActivity : ComponentActivity(), VoiceManager.VoiceCallback {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (!android.provider.Settings.canDrawOverlays(this)) {
-                    val intent = Intent(
+                    startActivity(Intent(
                         android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
                         Uri.parse("package:$packageName")
-                    )
-                    startActivity(intent)
+                    ))
                     return
                 }
             }
-
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                    val intent = Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
+                    startActivity(Intent(
+                        android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                    ).apply { data = Uri.parse("package:$packageName") })
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to prompt for special system workspace exemptions", e)
+            Log.e(TAG, "Battery exemption request failed", e)
         }
     }
 
     override fun onListening() {
-        listening = true
-        status.value = "Listening..."
+        runOnUiThread {
+            listening = true
+            status.value = "Listening..."
+        }
     }
 
-    override fun onCommand(text: String) {
-        val command = text.trim()
-
-        if (command.isBlank()) {
-            status.value = "Ready"
-            WakeWordService.resetProcessing()
+    override fun onCommand(text: String, sessionId: Long) {
+        if (!SpidyStateManager.isSessionValid(sessionId)) {
+            Log.w(TAG, "Ignoring stale session command: $sessionId")
             return
         }
-        
+
+        val command = text.trim()
+        if (command.isBlank()) {
+            runOnUiThread { status.value = "Ready"; listening = false }
+            WakeWordService.startService(this)
+            return
+        }
+
         val now = System.currentTimeMillis()
         if (command.equals(lastCommand, true) && now - lastCommandTime < 1500) {
+            Log.w(TAG, "Duplicate command suppressed: '$command'")
             return
         }
 
         lastCommand = command
         lastCommandTime = now
-        listening = false
-        status.value = "Thinking..."
+        touchSession() // Keep session warm
 
-        messages.add(Message(command, true))
+        runOnUiThread {
+            listening = false
+            status.value = "Thinking..."
+            messages.add(Message(text = command, user = true))
+        }
 
-        lifecycleScope.launch {
-            val response = commandProcessor.process(command)
-            messages.add(Message(response, false))
-            status.value = "Ready"
+        SpidyStateManager.transitionTo(AssistantState.PROCESSING, sessionId)
 
-            assistant.handleResponse(response) {
-                WakeWordService.resetProcessing()
+        lifecycleScope.launch(Dispatchers.Default) {
+            val assistantMsgIndex = withContext(Dispatchers.Main) {
+                val idx = messages.size
+                messages.add(Message(text = "...", user = false))
+                idx
             }
-            
-            voiceManager.stopListening()
+
+            var accumulated = ""
+
+            val rawResponse = commandProcessor.processStream(command, sessionId) { token ->
+                accumulated += token
+                val clean = accumulated
+                    .replace(COMPLETED_THINK_REGEX, "")
+                    .replace(STREAMING_THINK_REGEX, "")
+                    .trimStart()
+
+                if (clean.isNotEmpty()) {
+                    runOnUiThread {
+                        if (assistantMsgIndex < messages.size) {
+                            messages[assistantMsgIndex] = Message(text = clean, user = false)
+                        }
+                    }
+                }
+            }
+
+            val finalText = rawResponse
+                .replace(COMPLETED_THINK_REGEX, "")
+                .replace(STREAMING_THINK_REGEX, "")
+                .trim()
+                .ifEmpty { "I couldn't process that." }
+
+            withContext(Dispatchers.Main) {
+                if (assistantMsgIndex < messages.size) {
+                    messages[assistantMsgIndex] = Message(text = finalText, user = false)
+                }
+                status.value = "Speaking..."
+            }
+
+            SpidyStateManager.transitionTo(AssistantState.SPEAKING, sessionId)
+
+            assistant.handleResponse(finalText, sessionId) { doneSession ->
+                if (SpidyStateManager.isSessionValid(doneSession)) {
+                    runOnUiThread {
+                        status.value = "Ready"
+                        listening = false
+                        WakeWordService.startService(this@MainActivity)
+                    }
+                }
+            }
         }
     }
 
-    override fun onError(errorCode: Int) {
-        listening = false
-        status.value = "Ready"
-        WakeWordService.resetProcessing()
+    override fun onError(errorCode: Int, sessionId: Long) {
+        if (!SpidyStateManager.isSessionValid(sessionId)) return
+        Log.w(TAG, "Voice error $errorCode on session $sessionId")
+        runOnUiThread { listening = false; status.value = "Ready" }
+        WakeWordService.startService(this)
     }
 
     override fun onDestroy() {
+        commandProcessor.releaseResources()
         voiceManager.destroy()
+        assistant.destroy()
         super.onDestroy()
     }
 }
-
-data class Message(
-    val text: String,
-    val user: Boolean
-)

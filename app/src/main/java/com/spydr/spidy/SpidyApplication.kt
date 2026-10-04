@@ -2,13 +2,14 @@ package com.spydr.spidy
 
 import android.app.Application
 import android.util.Log
+import com.chaquo.python.Python
+import com.chaquo.python.android.AndroidPlatform
 
 class SpidyApplication : Application() {
 
     companion object {
         private const val TAG = "SpidyApplication"
 
-        // Thread-safe volatile backing reference for global application context availability
         @Volatile
         private var _instance: SpidyApplication? = null
 
@@ -20,11 +21,14 @@ class SpidyApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
-        
+        if (!Python.isStarted()) {
+            Python.start(AndroidPlatform(this))
+        }
+
         synchronized(SpidyApplication::class.java) {
             _instance = this
         }
-        
+
         Log.d(TAG, "Spidy Application global context initialized successfully.")
     }
 

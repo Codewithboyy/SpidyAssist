@@ -1,45 +1,60 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FIXED: Re-inserted the precise schemas.android.com namespace path -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
 
-    <!-- Core Audio and Background Operations Permissions -->
+    <!-- Core Audio and Background Operations -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
-    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" 
-    tools:ignore="QueryAllPackagesPermission" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- Calling -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
 
-    
-    <!-- Contacts Access Permission -->
+    <!-- SMS -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+
+    <!-- Flashlight -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- Alarms & Timers -->
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+
+    <!-- Contacts -->
     <uses-permission android:name="android.permission.READ_CONTACTS"/>
 
-    <!-- Modern Type-Safe Media Storage Permissions (Android 13 to 16 Compliance) -->
+    <!-- Media Storage -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
 
-    <!-- Legacy Storage Fallback Permission -->
-    <uses-permission 
+    <!-- Legacy Storage Fallback -->
+    <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
 
-    <!-- Enforce hardware profile dependencies -->
-    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <!-- Hardware Features -->
     <uses-feature
         android:name="android.hardware.microphone"
         android:required="true"/>
+    <uses-feature
+        android:name="android.hardware.camera.flash"
+        android:required="false" />
 
     <application
         android:name="com.spydr.spidy.SpidyApplication"
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-    android:roundIcon="@mipmap/ic_launcher_round"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="Spidy Assist"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.DayNight"
@@ -49,13 +64,16 @@
             android:name="com.spydr.spidy.MainActivity"
             android:exported="true"
             android:launchMode="singleTop"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:configChanges="orientation|screenSize|keyboardHidden">
-            
-            <!-- UPDATE THIS LINE: Forces the Activity window to be completely translucent -->
-            android:theme="@android:style/Theme.Translucent.NoTitleBar">
 
             <intent-filter>
                 <action android:name="android.intent.action.ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VOICE_COMMAND" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
 
@@ -65,11 +83,10 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground Service definition -->
         <service
             android:name="com.spydr.spidy.WakeWordService"
-            android:exported="false"
             android:enabled="true"
+            android:exported="false"
             android:foregroundServiceType="microphone"
             tools:node="merge" />
 

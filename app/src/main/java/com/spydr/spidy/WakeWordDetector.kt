@@ -4,8 +4,9 @@ import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -14,6 +15,10 @@ import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 class WakeWordDetector(
     private val context: Context,
@@ -24,132 +29,200 @@ class WakeWordDetector(
         fun onWakeWordDetected()
     }
 
-    private companion object {
+    companion object {
         private const val TAG = "WakeWordDetector"
         private const val SAMPLE_RATE = 16000.0f
+
+        // Restricted grammar — only accepted wake words + unknown fallback
+        private const val GRAMMAR_JSON =
+            "[\"hey spider\", \"hey spidy\", \"ok spider\", \"ok spidy\", \"spider\", \"spidey\", \"spidy\", \"[unk]\"]"
+
+        // Debounce: ignore triggers within this window after one fires
+        private const val TRIGGER_DEBOUNCE_MS = 2000L
+
+        // Auto-restart on error after this delay
+        private const val ERROR_RESTART_DELAY_MS = 1500L
+
+        // Max consecutive errors before giving up restart loop
+        private const val MAX_CONSECUTIVE_ERRORS = 5
     }
 
-    private val scope = CoroutineScope(Dispatchers.Main + Job())
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private var model: Model? = null
-    private var recognizer: Recognizer? = null
     private var speechService: SpeechService? = null
-    
-    @Volatile
-    private var wakeWordTriggered = false
-    
-    fun resetWakeWord() {
-        wakeWordTriggered = false
-    }
+    private var recognizer: Recognizer? = null
+    private var model: Model? = null
+
+    private val isListening = AtomicBoolean(false)
+    private val hasTriggered = AtomicBoolean(false)
+    private val isInitializing = AtomicBoolean(false)
+    private val lastTriggerTime = AtomicLong(0L)
+    private val consecutiveErrors = AtomicInteger(0)
+
+    // ── Public API ────────────────────────────────────────────────────────────
 
     fun start() {
-        scope.launch {
-            try {
-                val activeRecognizer = prepareRecognizer() ?: return@launch
-                shutdownSpeechServiceOnly()
-
-                speechService = SpeechService(activeRecognizer, SAMPLE_RATE)
-                speechService?.startListening(this@WakeWordDetector)
-                Log.d(TAG, "Continuous wake word detection listening started.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to start speech service context", e)
-            }
-        }
-    }
-
-    private suspend fun prepareRecognizer(): Recognizer? = withContext(Dispatchers.IO) {
-        try {
-            recognizer?.let { return@withContext it }
-
-            val modelDir = File(context.filesDir, "model")
-            if (!modelDir.exists()) {
-                Log.d(TAG, "Model directory not found. Copying assets...")
-                AssetUtils.copyAssetFolder(context, "model", modelDir)
-            }
-
-            if (model == null) {
-                model = Model(modelDir.absolutePath)
-            }
-            
-            // Keeps your expanded grammar rules for much better reliability
-            val grammarJson = "[\"spider\", \"spyder\", \"speedy\", \"spid\", \"[unk]\"]"
-
-            val createdRecognizer = Recognizer(model, SAMPLE_RATE, grammarJson)
-            recognizer = createdRecognizer
-            createdRecognizer
-        } catch (e: Exception) {
-            Log.e(TAG, "Model or Recognizer creation crashed globally", e)
-            null
-        }
-    }
-
-    private fun shutdownSpeechServiceOnly() {
-        try {
-            speechService?.stop()
-            speechService?.shutdown()
-            speechService = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error cleaning transient speech service context", e)
-        }
+        if (isListening.get() || isInitializing.get()) return
+        isInitializing.set(true)
+        scope.launch { initializeAndStart() }
     }
 
     fun stop() {
-        shutdownSpeechServiceOnly()
+        if (!isListening.getAndSet(false) && !isInitializing.get()) return
+        shutdownSpeechService()
+        hasTriggered.set(false)
+        Log.d(TAG, "WakeWordDetector stopped.")
+    }
+
+    fun resetWakeWord() {
+        stop()
+    }
+
+    fun destroy() {
+        stop()
         scope.cancel()
+        try { model?.close() } catch (e: Exception) { Log.e(TAG, "Error closing Vosk model", e) }
+        model = null
+    }
 
+    // ── Initialization ────────────────────────────────────────────────────────
+
+    private suspend fun initializeAndStart() {
         try {
-            recognizer?.close()
-            recognizer = null
-            
-            model?.close()
-            model = null
-        } catch (e: Exception) {
-            Log.e(TAG, "Error finalizing local audio engine memory profiles", e)
-        }
-    }
-
-    override fun onPartialResult(hypothesis: String?) {}
-
-    override fun onResult(hypothesis: String?) {
-        if (hypothesis.isNullOrEmpty() || wakeWordTriggered) return
-
-        scope.launch(Dispatchers.Default) {
-            try {
-                val json = JSONObject(hypothesis)
-                val text = json.optString("text", "").lowercase()
-
-                // Match against any of our target vocabulary variations
-                if (text == "spider" || text == "spyder" || text == "speedy" || text == "spid") {
-                    wakeWordTriggered = true
-                    withContext(Dispatchers.Main) {
-                        listener.onWakeWordDetected()
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Error matching expanded wake word result framework", e)
+            val modelPath = File(context.filesDir, "vosk-model-small-en-us-0.15")
+            if (!modelPath.exists()) {
+                Log.e(TAG, "Vosk model not found at ${modelPath.absolutePath}")
+                isInitializing.set(false)
+                return
             }
+
+            withContext(Dispatchers.IO) {
+                if (model == null) {
+                    model = Model(modelPath.absolutePath)
+                    Log.d(TAG, "Vosk model loaded.")
+                }
+                recognizer?.close()
+                recognizer = Recognizer(model, SAMPLE_RATE, GRAMMAR_JSON)
+            }
+
+            withContext(Dispatchers.Main) {
+                if (isListening.get()) {
+                    isInitializing.set(false)
+                    return@withContext
+                }
+
+                hasTriggered.set(false)
+                val rec = recognizer
+                if (rec != null) {
+                    speechService = SpeechService(rec, SAMPLE_RATE).apply {
+                        startListening(this@WakeWordDetector)
+                    }
+                    isListening.set(true)
+                    consecutiveErrors.set(0)
+                    Log.d(TAG, "Wake word listener active. Grammar: $GRAMMAR_JSON")
+                }
+                isInitializing.set(false)
+            }
+        } catch (e: IOException) {
+            Log.e(TAG, "Vosk init IO error", e)
+            isInitializing.set(false)
+        } catch (e: Exception) {
+            Log.e(TAG, "Vosk init error", e)
+            isInitializing.set(false)
         }
     }
 
-    override fun onFinalResult(hypothesis: String?) {}
+    private fun shutdownSpeechService() {
+        try {
+            speechService?.stop()
+            speechService?.shutdown()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error shutting down SpeechService", e)
+        } finally {
+            speechService = null
+            try { recognizer?.close() } catch (e: Exception) { Log.e(TAG, "Error closing Recognizer", e) }
+            recognizer = null
+        }
+    }
+
+    // ── RecognitionListener ───────────────────────────────────────────────────
+
+    override fun onResult(hypothesis: String?) = checkWakeWord(hypothesis, "result")
+    override fun onFinalResult(hypothesis: String?) = checkWakeWord(hypothesis, "final")
+    override fun onPartialResult(hypothesis: String?) = checkWakeWord(hypothesis, "partial")
 
     override fun onError(exception: Exception?) {
-        Log.e(TAG, "Vosk internal pipeline native error event triggered", exception)
-        
-        // BUG FIX: If the OS drops the background stream, don't crash.
-        // Clean up the stale handles and launch the ear again automatically.
-        scope.launch(Dispatchers.Main) {
-            try {
-                shutdownSpeechServiceOnly()
-                // Small 1-second recovery window to allow system hardware states to normalize
-                kotlinx.coroutines.delay(1000)
-                start() 
-                Log.d(TAG, "Successfully recovered background microphone engine context.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to self-heal background streaming loop", e)
+        Log.e(TAG, "Vosk recognition error", exception)
+        val errors = consecutiveErrors.incrementAndGet()
+
+        if (errors >= MAX_CONSECUTIVE_ERRORS) {
+            Log.e(TAG, "Max consecutive errors ($MAX_CONSECUTIVE_ERRORS) reached. Stopping.")
+            isListening.set(false)
+            return
+        }
+
+        // Auto-restart after brief delay
+        if (isListening.get()) {
+            isListening.set(false)
+            scope.launch {
+                delay(ERROR_RESTART_DELAY_MS)
+                Log.d(TAG, "Auto-restarting after error (attempt $errors).")
+                start()
             }
         }
     }
 
-    override fun onTimeout() {}
+    override fun onTimeout() {
+        Log.d(TAG, "Vosk timeout — restarting listener.")
+        // Timeout = silence timeout, restart to keep listening
+        if (isListening.get()) {
+            isListening.set(false)
+            scope.launch {
+                delay(300L)
+                start()
+            }
+        }
+    }
+
+    // ── Wake word matching ────────────────────────────────────────────────────
+
+    private fun checkWakeWord(hypothesisJson: String?, source: String) {
+        if (hypothesisJson.isNullOrBlank() || !isListening.get() || hasTriggered.get()) return
+
+        try {
+            val json = JSONObject(hypothesisJson)
+            val text = when {
+                json.has("partial") -> json.getString("partial")
+                json.has("text") -> json.getString("text")
+                else -> ""
+            }.lowercase().trim()
+
+            if (text.isEmpty() || text == "[unk]") return
+
+            if (WakeWordService.isWakeWordMatch(text)) {
+                val state = SpidyStateManager.activeState
+                if (state == AssistantState.PROCESSING || state == AssistantState.SPEAKING) {
+                    Log.d(TAG, "Wake word ignored — busy state: $state")
+                    return
+                }
+
+                // Debounce: suppress double-triggers within 2 seconds
+                val now = System.currentTimeMillis()
+                val last = lastTriggerTime.get()
+                if (now - last < TRIGGER_DEBOUNCE_MS) {
+                    Log.d(TAG, "Wake word debounced (${now - last}ms since last trigger)")
+                    return
+                }
+
+                Log.d(TAG, "Wake word matched [$source]: '$text'")
+                if (hasTriggered.compareAndSet(false, true)) {
+                    lastTriggerTime.set(now)
+                    consecutiveErrors.set(0)
+                    listener.onWakeWordDetected()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Hypothesis parse error: $hypothesisJson", e)
+        }
+    }
 }
